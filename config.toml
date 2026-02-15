@@ -1,0 +1,79 @@
+# UPS Shutdown Daemon Configuration
+# Location: /etc/ups-shutdown/config.toml
+
+# ─────────────────────────────────────────────────────────────────────
+# SNMP
+# ─────────────────────────────────────────────────────────────────────
+[snmp]
+trap_port = 162
+
+# REQUIRED: must match the community string configured on the UPS.
+# Change from this example value before deploying.
+community_string = "public"
+
+# Optional: restrict accepted trap sources to specific UPS IPs.
+# Leave as [] to accept from any source.
+# Example: allowed_sources = ["192.168.1.10"]
+allowed_sources = ["127.0.0.1"]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Shutdown timing
+# ─────────────────────────────────────────────────────────────────────
+[shutdown]
+
+# ── Timer-based (normal) shutdown ─────────────────────────────────────
+#
+# Maximum time (seconds) the UPS may run on battery before a normal
+# shutdown is initiated.
+# Starts when trap #5 (UpsOnBattery) is received.
+# Cancelled by trap #9 (PowerRestored) or #49 (UpsBypassAcNormal).
+time_on_battery = 120
+
+# Maximum time (seconds) after trap #7 (LowBattery) is received
+# while already on battery, before a normal shutdown is initiated.
+# Must be <= time_on_battery.
+# Whichever timer fires first (on-battery or low-battery) wins.
+# Cleared by trap #11 (ReturnFromLowBattery).
+time_on_low_battery = 30
+
+# Graceful countdown (seconds) broadcast to logged-in users before
+# the actual poweroff executes.  Used for both timer-based shutdowns.
+delay_seconds = 30
+
+
+# ── Instant-shutdown traps ─────────────────────────────────────────────
+#
+# Short countdown (seconds) for hardware-fault traps and when the
+# communication-lost timer fires.  These cannot be cancelled.
+#
+# Instant-shutdown traps:
+#   #3  DiagnosticsFailed      — UPS failed self-test
+#   #4  UpsDischarged          — runtime calibration discharge
+#   #12 UpsTurnedOff           — turned off by management
+#   #15 UpsRebootStarted       — reboot sequence started
+#   #52 UpsScheduleShutdown
+#   #54 UpsShortCircuitShutdown
+#   #57 UpsHighDCShutdown
+#   #58 UpsEmergencyStop
+#   #61 UpsOverTemperatureShutdown
+#   #62 UpsOverLoadShutdown
+#   #67 UpsLowBatteryShutdown  — UPS itself shutting down
+immediate_delay_seconds = 3
+
+# ── Pre-shutdown script ────────────────────────────────────────────────
+# Optional: absolute path to an executable run just before poweroff.
+# The file must exist and be executable — checked at startup.
+# pre_shutdown_script = "/usr/local/bin/cleanup.sh"
+
+# Hard deadline for pre_shutdown_script (seconds).
+script_timeout_seconds = 25
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────
+[logging]
+trap_log_file = "/var/log/ups-traps.log"
+# Mirror all log lines to stdout (same as --verbose CLI flag).
+verbose = false
