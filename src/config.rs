@@ -64,6 +64,7 @@ pub struct ShutdownConfig {
     // ── Pre-shutdown script ────────────────────────────────────────────────
 
     /// Absolute path to an executable script run just before poweroff.
+    /// Absolute path to an executable script run just before poweroff.
     /// Validated at startup: must exist and be executable.
     pub pre_shutdown_script: Option<String>,
 

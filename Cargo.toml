@@ -4,17 +4,23 @@ version = "1.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.35", features = [
+    "macros",    # #[tokio::main]
+    "rt",        # current_thread runtime + tokio::spawn
+    "net",       # UdpSocket
+    "time",      # sleep, Instant, interval_at, timeout
+    "process",   # tokio::process::Command (pre-shutdown script)
+    "io-util",   # required by signal-hook-tokio
+] }
 syslog = "6.1"
-chrono = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 anyhow = "1.0"
-thiserror = "1.0"
 signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 clap = { version = "4.4", features = ["derive"] }
-nix = { version = "0.27", features = ["process", "signal", "reboot", "fs", "user"] }
+nix = { version = "0.27", features = ["reboot", "user", "fs"] }  # fs required for nix::unistd::sync
 futures = "0.3"
 
 [profile.release]
@@ -22,3 +28,5 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort"       # skip stack unwinding on panic — systemd Restart=always handles
+                      # recovery; unwinding destructors in a corrupt process is pointless
