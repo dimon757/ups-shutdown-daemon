@@ -9,7 +9,7 @@ trap_port = 162
 
 # REQUIRED: must match the community string configured on the UPS.
 # Change from this example value before deploying.
-community_string = "public"
+community_string = "ups_secret"
 
 # Optional: restrict accepted trap sources to specific UPS IPs.
 # Leave as [] to accept from any source.
@@ -28,7 +28,7 @@ allowed_sources = []
 # shutdown is initiated.
 # Starts when trap #5 (UpsOnBattery) is received.
 # Cancelled by trap #9 (PowerRestored) or #49 (UpsBypassAcNormal).
-time_on_battery = 60
+time_on_battery = 300
 
 # Maximum time (seconds) after trap #7 (LowBattery) is received
 # while already on battery, before a normal shutdown is initiated.
