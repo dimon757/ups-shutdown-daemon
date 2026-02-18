@@ -9,7 +9,7 @@ trap_port = 162
 
 # REQUIRED: must match the community string configured on the UPS.
 # Change from this example value before deploying.
-community_string = "ups_secret"
+community_string = "public"
 
 # Optional: restrict accepted trap sources to specific UPS IPs.
 # Leave as [] to accept from any source.
@@ -28,18 +28,18 @@ allowed_sources = []
 # shutdown is initiated.
 # Starts when trap #5 (UpsOnBattery) is received.
 # Cancelled by trap #9 (PowerRestored) or #49 (UpsBypassAcNormal).
-time_on_battery = 300
+time_on_battery = 60
 
 # Maximum time (seconds) after trap #7 (LowBattery) is received
 # while already on battery, before a normal shutdown is initiated.
 # Must be <= time_on_battery.
 # Whichever timer fires first (on-battery or low-battery) wins.
 # Cleared by trap #11 (ReturnFromLowBattery).
-time_on_low_battery = 60
+time_on_low_battery = 19
 
 # Graceful countdown (seconds) broadcast to logged-in users before
 # the actual poweroff executes.  Used for both timer-based shutdowns.
-delay_seconds = 30
+delay_seconds = 5
 
 
 # ── Instant-shutdown traps ─────────────────────────────────────────────
@@ -59,7 +59,7 @@ delay_seconds = 30
 #   #61 UpsOverTemperatureShutdown
 #   #62 UpsOverLoadShutdown
 #   #67 UpsLowBatteryShutdown  — UPS itself shutting down
-immediate_delay_seconds = 5
+immediate_delay_seconds = 2
 
 # ── Pre-shutdown script ────────────────────────────────────────────────
 # Optional: absolute path to an executable run just before poweroff.

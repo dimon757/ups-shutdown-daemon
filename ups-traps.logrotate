@@ -1,0 +1,22 @@
+# /etc/logrotate.d/ups-traps
+#
+# The daemon holds the log file open permanently (no per-line open/close).
+# Standard logrotate renames the file and sends a signal — but the daemon
+# has no SIGHUP handler to reopen it, so it would keep writing to the old
+# inode.  copytruncate truncates the live file in-place instead, which
+# works correctly with a permanently-open file handle.
+#
+# Trade-off: there is a small window between the copy and the truncate where
+# log lines can be lost.  For a UPS trap log this is acceptable.
+#
+# Install: cp ups-traps.logrotate /etc/logrotate.d/ups-traps
+
+/var/log/ups-traps.log {
+    weekly
+    rotate 52
+    compress
+    copytruncate
+    missingok
+    notifempty
+    create 0640 root root
+}

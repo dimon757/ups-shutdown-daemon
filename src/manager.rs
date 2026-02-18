@@ -8,7 +8,6 @@ use nix::unistd::sync;
 use std::fs::File;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +36,7 @@ impl ShutdownManager {
         let formatter = Formatter3164 {
             facility: Facility::LOG_DAEMON,
             hostname: None,
-            process:  "ups-shutdown".into(),
+            process:  "ups-shutdown-daemon".into(),
             pid:      std::process::id(),
         };
         let logger = syslog::unix(formatter)
@@ -235,7 +234,7 @@ impl ShutdownManager {
 
             StateTransition::ExitOnBattery { reason } => {
                 let msg = format!("Trap #{} {}", trap as u64, trap.description());
-                let _ = Command::new("wall").arg(&msg).output();
+                let _ = tokio::process::Command::new("wall").arg(&msg).output().await;
                 self.exit_on_battery(reason);
             }
 
@@ -275,7 +274,7 @@ impl ShutdownManager {
             delay, reason,
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
         );
-        let _ = Command::new("wall").arg(&msg).output();
+        let _ = tokio::process::Command::new("wall").arg(&msg).output().await;
         let _ = self.logger.err(&msg);
         self.log_file_only(&msg);
 
@@ -315,7 +314,7 @@ impl ShutdownManager {
             delay, reason,
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
         );
-        let _ = Command::new("wall").arg(&msg).output();
+        let _ = tokio::process::Command::new("wall").arg(&msg).output().await;
         let _ = self.logger.err(&msg);
         self.log_file_only(&msg);
 
@@ -350,9 +349,10 @@ async fn run_script_and_poweroff(script: Option<String>, script_timeout: u64) {
             Err(_)         => eprintln!("pre_shutdown_script timed out after {}s — proceeding", script_timeout),
         }
     }
-    let ok = Command::new("systemctl")
+    let ok = tokio::process::Command::new("systemctl")
         .args(["poweroff", "--no-wall"])
         .status()
+        .await
         .map(|s| s.success())
         .unwrap_or(false);
 

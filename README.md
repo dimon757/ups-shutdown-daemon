@@ -59,6 +59,8 @@ shutdown when configured thresholds are exceeded.
   or with a wrong community string are dropped and logged
 - **`systemctl poweroff`** for clean systemd shutdown; raw kernel reboot as
   fallback
+- **`wall` is non-blocking** — all broadcast calls use `tokio::process::Command`
+  so the async event loop is never blocked waiting for `wall` to finish
 - **Log file held open** — the trap log is opened once at startup and kept open
   for the daemon lifetime; no `open()`/`close()` syscall pair per log line
 - **State owns its transitions** — `UpsState::apply()` decides what a trap
@@ -76,9 +78,11 @@ src/
   trap.rs      UpsTrap enum, UpsState, StateTransition — 227 lines
   snmp.rs      Pure ASN.1 / SNMP parsing — 131 lines
   manager.rs   ShutdownManager: logging, dispatch, shutdown — 364 lines
-config.toml    Annotated example configuration
-Cargo.toml     Package manifest and dependencies
-send-ups-traps.py  Interactive trap test tool
+config.toml                  Annotated example configuration
+Cargo.toml                  Package manifest and dependencies
+ups-shutdown-daemon.service systemd unit file
+send-ups-traps.py           Interactive trap test tool
+ups-traps.logrotate         logrotate config (copytruncate for held-open handle)
 ```
 
 ### Module responsibilities
@@ -169,7 +173,13 @@ chown root:root /var/log/ups-traps.log
 
 ### systemd unit file
 
-Create `/etc/systemd/system/ups-shutdown.service`:
+Create `/etc/systemd/system/ups-shutdown-daemon.service`:
+
+```bash
+cp ups-shutdown-daemon.service /etc/systemd/system/
+```
+
+Or create manually:
 
 ```ini
 [Unit]
@@ -195,10 +205,10 @@ WantedBy=multi-user.target
 
 ```bash
 systemctl daemon-reload
-systemctl enable ups-shutdown
-systemctl start ups-shutdown
-systemctl status ups-shutdown
-journalctl -u ups-shutdown -f
+systemctl enable ups-shutdown-daemon
+systemctl start ups-shutdown-daemon
+systemctl status ups-shutdown-daemon
+journalctl -u ups-shutdown-daemon -f
 ss -ulnp | grep 162
 ```
 
@@ -219,18 +229,31 @@ Ready — listening for SNMP traps.
 
 ### Log rotation
 
-Create `/etc/logrotate.d/ups-traps`:
+The daemon holds the log file open permanently. Standard logrotate would
+rename the file and keep writing to the old inode. Use `copytruncate` to
+truncate the file in-place instead:
+
+```bash
+cp ups-traps.logrotate /etc/logrotate.d/ups-traps
+```
+
+Contents of `ups-traps.logrotate` (included in the zip):
 
 ```
 /var/log/ups-traps.log {
     weekly
     rotate 52
     compress
+    copytruncate
     missingok
     notifempty
     create 0640 root root
 }
 ```
+
+`copytruncate` has a small copy-then-truncate window where a log line could
+be lost. For a UPS trap log that sees a handful of events per year this is
+acceptable. The alternative is a SIGHUP handler that reopens the file.
 
 ### SELinux (CentOS 8/9 enforcing)
 
@@ -837,6 +860,10 @@ The log file is opened once at startup (`init()`) and the handle is held in
 `ShutdownManager` for the daemon lifetime. There is no per-line `open()`/
 `close()` overhead.
 
+> **Log rotation:** because the handle is held open, logrotate must use
+> `copytruncate` (see `ups-traps.logrotate`). Standard rename-based rotation
+> would cause the daemon to keep writing to the old inode after rotation.
+
 `log_file_only()` is used for SHUTDOWN announcement lines that are also sent
 via `wall` — prevents the line appearing twice in verbose mode.
 
@@ -933,7 +960,7 @@ arrives in Normal state it is logged and ignored. Send trap #5 first.
 ### No packets appearing in log
 
 ```bash
-systemctl status ups-shutdown
+systemctl status ups-shutdown-daemon
 ss -ulnp | grep 162
 tcpdump -i any -n udp port 162
 firewall-cmd --list-all

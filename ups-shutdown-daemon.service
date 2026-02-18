@@ -1,0 +1,32 @@
+# /etc/systemd/system/ups-shutdown-daemon.service
+#
+# Systemd unit for ups-shutdown-daemon — UPS SNMP trap listener.
+#
+# Install:
+#   cp ups-shutdown-daemon.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable ups-shutdown-daemon
+#   systemctl start ups-shutdown-daemon
+
+[Unit]
+Description=UPS SNMP Trap Shutdown Daemon (PPC/Upsmate)
+Documentation=file:///usr/local/share/doc/ups-shutdown-daemon/README.md
+After=network.target syslog.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ups-shutdown-daemon --config /etc/ups-shutdown/config.toml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+User=root
+
+# Restrict capabilities to minimum required:
+#   CAP_NET_BIND_SERVICE — bind UDP port 162 (privileged port)
+#   CAP_SYS_BOOT         — raw kernel reboot (fallback only)
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_BOOT
+
+[Install]
+WantedBy=multi-user.target
