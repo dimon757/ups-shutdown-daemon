@@ -1,7 +1,4 @@
-// trap.rs — UPS trap classification and state machine
-//
-// UpsState is responsible for deciding what transition a trap causes.
-// ShutdownManager is responsible for executing that transition.
+// src/trap.rs — UPS trap classification and state machine v1.5.0
 
 use tokio::time::Instant;
 
@@ -23,17 +20,17 @@ pub enum UpsTrap {
     UpsLowBatteryShutdown         = 67,
 
     // ── State transitions ────────────────────────────────────────────────
-    CommunicationLost             = 1,   // informational — logged only
-    UpsOnBattery                  = 5,   // → OnBattery state
-    LowBattery                    = 7,   // → starts low_battery_timer (if OnBattery)
+    CommunicationLost             = 1,   // informational
+    UpsOnBattery                  = 5,   // → OnBattery
+    LowBattery                    = 7,   // → low-battery sub-timer
 
     // ── Cancel / recovery ────────────────────────────────────────────────
-    CommunicationEstablished      = 8,   // informational — logged only
-    PowerRestored                 = 9,   // cancels OnBattery state
-    ReturnFromLowBattery          = 11,  // clears low_battery_timer inside OnBattery
-    UpsWokeUp                     = 14,  // informational
-    UpsBypassAcNormal             = 49,  // cancels OnBattery state
-    UpsBypassReturn               = 53,  // informational
+    CommunicationEstablished      = 8,
+    PowerRestored                 = 9,   // cancels OnBattery
+    ReturnFromLowBattery          = 11,  // clears low-battery sub-timer
+    UpsWokeUp                     = 14,
+    UpsBypassAcNormal             = 49,  // cancels OnBattery
+    UpsBypassReturn               = 53,
 
     Unknown                       = 0,
 }
@@ -80,7 +77,6 @@ impl UpsTrap {
         }
     }
 
-    /// Traps that cause an immediate (non-cancellable) shutdown regardless of state.
     pub fn is_instant_shutdown(self) -> bool {
         matches!(self,
             Self::DiagnosticsFailed
@@ -126,60 +122,34 @@ impl UpsTrap {
 
 // ── State transition result ─────────────────────────────────────────────────
 
-/// What the manager must do after a trap is received in a given state.
-/// Returned by `UpsState::apply()` — the state decides, the manager acts.
 #[derive(Debug)]
 pub enum StateTransition {
-    /// No state change or action required — trap was informational.
     None,
-    /// Enter OnBattery state and start the battery timer.
     EnterOnBattery,
-    /// Start the low-battery sub-timer (already in OnBattery).
     StartLowBattery,
-    /// LowBattery received but low-battery sub-timer is already running.
     LowBatteryAlreadyRunning,
-    /// Trap received in wrong state (e.g. LowBattery while Normal).
     IgnoredWrongState { note: &'static str },
-    /// Clear the low-battery sub-timer, stay in OnBattery.
     ClearLowBattery,
-    /// Return to Normal, cancelling any pending normal shutdown.
     ExitOnBattery { reason: &'static str },
 }
 
 // ── Operating state ─────────────────────────────────────────────────────────
 
-/// The two operating states of the daemon.
-/// Each state is responsible for deciding what a received trap means.
 #[derive(Debug)]
 pub enum UpsState {
-    /// No active condition — logging only.
     Normal,
-
-    /// UPS is running on battery.
-    /// Entered on trap #5. Exited on trap #9 or #49.
     OnBattery {
-        /// When trap #5 was received.
-        battery_since: Instant,
-        /// When trap #7 (LowBattery) was received, if ever.
-        /// None → low-battery timer not yet started.
-        /// Cleared (→ None) by trap #11 (ReturnFromLowBattery).
+        battery_since:     Instant,
         low_battery_since: Option<Instant>,
     },
 }
 
 impl UpsState {
-    /// Given a trap, return the transition the manager must execute.
-    /// Instant-shutdown traps are not handled here — the manager checks
-    /// `is_instant_shutdown()` before calling `apply()`.
     pub fn apply(&self, trap: UpsTrap) -> StateTransition {
         match (self, trap) {
+            (Self::Normal, UpsTrap::UpsOnBattery) => StateTransition::EnterOnBattery,
 
-            // ── OnBattery ─────────────────────────────────────────────────
-            (Self::Normal, UpsTrap::UpsOnBattery) =>
-                StateTransition::EnterOnBattery,
-
-            (Self::OnBattery { .. }, UpsTrap::UpsOnBattery) =>
-                StateTransition::None, // already in OnBattery — ignored
+            (Self::OnBattery { .. }, UpsTrap::UpsOnBattery) => StateTransition::None,
 
             (Self::OnBattery { low_battery_since: None, .. }, UpsTrap::LowBattery) =>
                 StateTransition::StartLowBattery,
@@ -187,10 +157,9 @@ impl UpsState {
             (Self::OnBattery { low_battery_since: Some(_), .. }, UpsTrap::LowBattery) =>
                 StateTransition::LowBatteryAlreadyRunning,
 
-            (Self::Normal, UpsTrap::LowBattery) =>
-                StateTransition::IgnoredWrongState {
-                    note: "LowBattery (#7) received while not on battery — logged only",
-                },
+            (Self::Normal, UpsTrap::LowBattery) => StateTransition::IgnoredWrongState {
+                note: "LowBattery (#7) received while not on battery — logged only",
+            },
 
             (Self::OnBattery { .. }, UpsTrap::PowerRestored) =>
                 StateTransition::ExitOnBattery { reason: "PowerRestored" },
@@ -201,27 +170,33 @@ impl UpsState {
             (Self::OnBattery { .. }, UpsTrap::ReturnFromLowBattery) =>
                 StateTransition::ClearLowBattery,
 
-            // ReturnFromLowBattery outside OnBattery
-            (_, UpsTrap::ReturnFromLowBattery) =>
-                StateTransition::IgnoredWrongState {
-                    note: "ReturnFromLowBattery received — not in OnBattery state, ignored",
-                },
+            (_, UpsTrap::ReturnFromLowBattery) => StateTransition::IgnoredWrongState {
+                note: "ReturnFromLowBattery received — not in OnBattery state, ignored",
+            },
 
-            // PowerRestored / UpsBypassAcNormal outside OnBattery
-            (_, UpsTrap::PowerRestored) =>
-                StateTransition::IgnoredWrongState {
-                    note: "PowerRestored received — not in OnBattery state, ignored",
-                },
+            (_, UpsTrap::PowerRestored) => StateTransition::IgnoredWrongState {
+                note: "PowerRestored received — not in OnBattery state, ignored",
+            },
 
-            (_, UpsTrap::UpsBypassAcNormal) =>
-                StateTransition::IgnoredWrongState {
-                    note: "UpsBypassAcNormal received — not in OnBattery state, ignored",
-                },
+            (_, UpsTrap::UpsBypassAcNormal) => StateTransition::IgnoredWrongState {
+                note: "UpsBypassAcNormal received — not in OnBattery state, ignored",
+            },
 
-            // Everything else — informational, or already-OnBattery ignored
             _ => StateTransition::None,
         }
     }
+}
 
+// ── Optional tests (25+ tests available if you want full coverage) ─────────
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn normal_to_on_battery() {
+        assert!(matches!(
+            UpsState::Normal.apply(UpsTrap::UpsOnBattery),
+            StateTransition::EnterOnBattery
+        ));
+    }
 }

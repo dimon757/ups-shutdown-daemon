@@ -1,11 +1,11 @@
-// manager.rs — ShutdownManager: logging, state machine, shutdown execution
+// src/manager.rs — ShutdownManager v1.5.0
 
 use crate::config::Config;
 use crate::trap::{StateTransition, UpsTrap, UpsState};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use nix::sys::reboot::{reboot, RebootMode};
 use nix::unistd::sync;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,17 +22,24 @@ pub struct ShutdownManager {
     verbose:            bool,
     state:              UpsState,
     /// Log file opened once at startup and held open for the daemon lifetime.
-    /// Eliminates an open()/close() syscall pair on every log line.
     log_file:           File,
+    /// Path to the log file (used for SIGHUP reopen).
+    log_path:           String,
     /// 10-second tick — active only when state is OnBattery, None otherwise.
     tick_interval:      Option<tokio::time::Interval>,
-    /// Shared with the spawned normal-shutdown task. Set false to cancel.
+    /// Shared with the spawned shutdown task. Set false to cancel.
     shutdown_scheduled: Arc<AtomicBool>,
     logger:             syslog::Logger<syslog::LoggerBackend, Formatter3164>,
 }
 
 impl ShutdownManager {
-    pub fn new(config: Config, log_file: File, test_mode: bool, verbose: bool) -> Result<Self> {
+    pub fn new(
+        config: Config,
+        log_path: String,
+        log_file: File,
+        test_mode: bool,
+        verbose: bool,
+    ) -> Result<Self> {
         let formatter = Formatter3164 {
             facility: Facility::LOG_DAEMON,
             hostname: None,
@@ -41,12 +48,14 @@ impl ShutdownManager {
         };
         let logger = syslog::unix(formatter)
             .map_err(|e| anyhow::anyhow!("Syslog init failed: {}", e))?;
+
         Ok(Self {
             config,
             test_mode,
             verbose,
-            log_file,
             state:              UpsState::Normal,
+            log_file,
+            log_path,
             tick_interval:      None,
             shutdown_scheduled: Arc::new(AtomicBool::new(false)),
             logger,
@@ -55,16 +64,12 @@ impl ShutdownManager {
 
     // ── Logging ─────────────────────────────────────────────────────────────
 
-    /// Write to the open log file and optionally stdout (verbose).
-    /// The file handle is held open for the daemon lifetime — no syscall overhead.
     fn log(&mut self, msg: &str) {
         if self.verbose { println!("{}", msg); }
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         let _ = writeln!(self.log_file, "[{}] {}", ts, msg);
     }
 
-    /// Write to log file only — used for shutdown announcements that are
-    /// already broadcast via `wall` to avoid printing the line twice.
     fn log_file_only(&mut self, msg: &str) {
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         let _ = writeln!(self.log_file, "[{}] {}", ts, msg);
@@ -154,33 +159,28 @@ impl ShutdownManager {
     // ── Periodic timer check (called every 10 s) ─────────────────────────────
 
     pub async fn check_timers(&mut self) -> Result<()> {
-        match self.state {
-            UpsState::OnBattery { battery_since, low_battery_since } => {
-                let on_bat_secs = battery_since.elapsed().as_secs();
+         if let UpsState::OnBattery { battery_since, low_battery_since } = &self.state {
+            let on_bat_secs = battery_since.elapsed().as_secs();
 
-                // Low-battery timer fires first if set and expired.
-                if let Some(lb) = low_battery_since {
-                    let lb_secs = lb.elapsed().as_secs();
-                    if lb_secs >= self.config.shutdown.time_on_low_battery {
-                        self.warn(&format!(
-                            "Low-battery timeout: {}s >= time_on_low_battery={}s — normal shutdown",
-                            lb_secs, self.config.shutdown.time_on_low_battery
-                        ));
-                        self.initiate_normal_shutdown("LowBattery timeout").await?;
-                        return Ok(());
-                    }
-                }
-
-                // On-battery timer.
-                if on_bat_secs >= self.config.shutdown.time_on_battery {
+            if let Some(lb) = low_battery_since {
+                let lb_secs = lb.elapsed().as_secs();
+                if lb_secs >= self.config.shutdown.time_on_low_battery {
                     self.warn(&format!(
-                        "On-battery timeout: {}s >= time_on_battery={}s — normal shutdown",
-                        on_bat_secs, self.config.shutdown.time_on_battery
+                        "Low-battery timeout: {}s >= time_on_low_battery={}s — normal shutdown",
+                        lb_secs, self.config.shutdown.time_on_low_battery
                     ));
-                    self.initiate_normal_shutdown("OnBattery timeout").await?;
+                    self.initiate_normal_shutdown("LowBattery timeout").await?;
+                    return Ok(());
                 }
             }
-            UpsState::Normal => {}
+
+            if on_bat_secs >= self.config.shutdown.time_on_battery {
+                self.warn(&format!(
+                    "On-battery timeout: {}s >= time_on_battery={}s — normal shutdown",
+                    on_bat_secs, self.config.shutdown.time_on_battery
+                ));
+                self.initiate_normal_shutdown("OnBattery timeout").await?;
+            }
         }
         Ok(())
     }
@@ -188,11 +188,9 @@ impl ShutdownManager {
     // ── Trap dispatcher ──────────────────────────────────────────────────────
 
     pub async fn handle_trap(&mut self, trap: UpsTrap, src: SocketAddr) -> Result<()> {
-        // Every trap is logged — primary audit trail.
         let msg = format!("Trap #{} ({}) from {}", trap as u64, trap.description(), src);
         self.info(&msg);
 
-        // Instant shutdown — non-cancellable, state-independent.
         if trap.is_instant_shutdown() {
             let reason = format!("Instant-shutdown trap: #{} {}", trap as u64, trap.description());
             self.err(&reason);
@@ -200,25 +198,15 @@ impl ShutdownManager {
             return Ok(());
         }
 
-        // Ask the current state what this trap means, then act on the answer.
         let transition = self.state.apply(trap);
         self.execute_transition(transition, trap).await
     }
 
-    /// Execute a state transition returned by `UpsState::apply()`.
-    async fn execute_transition(
-        &mut self,
-        transition: StateTransition,
-        trap: UpsTrap,
-    ) -> Result<()> {
+    async fn execute_transition(&mut self, transition: StateTransition, trap: UpsTrap) -> Result<()> {
         match transition {
-            StateTransition::EnterOnBattery => {
-                self.enter_on_battery();
-            }
+            StateTransition::EnterOnBattery => self.enter_on_battery(),
 
-            StateTransition::StartLowBattery => {
-                self.start_low_battery();
-            }
+            StateTransition::StartLowBattery => self.start_low_battery(),
 
             StateTransition::LowBatteryAlreadyRunning => {
                 self.info("LowBattery (#7) received — sub-timer already running, ignored");
@@ -228,9 +216,7 @@ impl ShutdownManager {
                 self.info(note);
             }
 
-            StateTransition::ClearLowBattery => {
-                self.clear_low_battery();
-            }
+            StateTransition::ClearLowBattery => self.clear_low_battery(),
 
             StateTransition::ExitOnBattery { reason } => {
                 let msg = format!("Trap #{} {}", trap as u64, trap.description());
@@ -239,16 +225,10 @@ impl ShutdownManager {
             }
 
             StateTransition::None => {
-                // Purely informational traps — already logged in handle_trap, no note needed.
-                // Covers: CommunicationLost, CommunicationEstablished, UpsWokeUp,
-                //         UpsBypassReturn, Unknown, UpsOnBattery-while-already-OnBattery.
                 let note = match trap {
-                    UpsTrap::CommunicationLost =>
-                        "CommunicationLost (#1) received — logged only, no action",
-                    UpsTrap::CommunicationEstablished =>
-                        "CommunicationEstablished (#8) received — informational",
-                    UpsTrap::UpsOnBattery =>
-                        "UpsOnBattery (#5) received — already in OnBattery state, ignored",
+                    UpsTrap::CommunicationLost => "CommunicationLost (#1) received — logged only, no action",
+                    UpsTrap::CommunicationEstablished => "CommunicationEstablished (#8) received — informational",
+                    UpsTrap::UpsOnBattery => "UpsOnBattery (#5) received — already in OnBattery state, ignored",
                     _ => return Ok(()),
                 };
                 self.info(note);
@@ -257,23 +237,26 @@ impl ShutdownManager {
         Ok(())
     }
 
-    // ── Shutdown execution ───────────────────────────────────────────────────
-
-    /// Normal (timer-based) shutdown: cancellable within delay_seconds window.
-    pub async fn initiate_normal_shutdown(&mut self, reason: &str) -> Result<()> {
+    // ── NEW: Unified shutdown scheduler (eliminates duplication + critical bug fix) ──
+    async fn schedule_shutdown(&mut self, delay: u64, reason: String, is_immediate: bool) -> Result<()> {
         if self.shutdown_scheduled.load(Ordering::SeqCst) {
-            self.stop_tick();
-            return Ok(());
+            if is_immediate {
+                self.shutdown_scheduled.store(false, Ordering::SeqCst); // ← CRITICAL FIX
+            } else {
+                self.stop_tick();
+                return Ok(());
+            }
         }
+
         self.shutdown_scheduled.store(true, Ordering::SeqCst);
         self.stop_tick();
 
-        let delay = self.config.shutdown.delay_seconds;
-        let msg   = format!(
-            "SHUTDOWN in {}s — {} [{}]",
-            delay, reason,
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        let prefix = if is_immediate { "IMMEDIATE" } else { "SHUTDOWN" };
+        let msg = format!(
+            "{} in {}s — {} [{}]",
+            prefix, delay, reason, chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
         );
+
         let _ = tokio::process::Command::new("wall").arg(&msg).output().await;
         let _ = self.logger.err(&msg);
         self.log_file_only(&msg);
@@ -283,14 +266,14 @@ impl ShutdownManager {
             return Ok(());
         }
 
-        let flag           = self.shutdown_scheduled.clone();
-        let script         = self.config.shutdown.pre_shutdown_script.clone();
+        let flag = self.shutdown_scheduled.clone();
+        let script = self.config.shutdown.pre_shutdown_script.clone();
         let script_timeout = self.config.shutdown.script_timeout_seconds;
 
         tokio::spawn(async move {
             sleep(Duration::from_secs(delay)).await;
             if !flag.load(Ordering::SeqCst) {
-                eprintln!("Normal shutdown cancelled during countdown.");
+                eprintln!("Shutdown cancelled during countdown.");
                 return;
             }
             run_script_and_poweroff(script, script_timeout).await;
@@ -299,38 +282,32 @@ impl ShutdownManager {
         Ok(())
     }
 
-    /// Immediate (non-cancellable) shutdown: short fixed delay then poweroff.
+    pub async fn initiate_normal_shutdown(&mut self, reason: &str) -> Result<()> {
+        self.schedule_shutdown(
+            self.config.shutdown.delay_seconds,
+            format!("{} (timer-based)", reason),
+            false,
+        ).await
+    }
+
     pub async fn initiate_immediate_shutdown(&mut self, reason: &str) -> Result<()> {
-        if self.shutdown_scheduled.load(Ordering::SeqCst) {
-            self.stop_tick();
-            return Ok(());
-        }
-        self.shutdown_scheduled.store(true, Ordering::SeqCst);
-        self.stop_tick();
+        self.schedule_shutdown(
+            self.config.shutdown.immediate_delay_seconds,
+            reason.to_string(),
+            true,
+        ).await
+    }
 
-        let delay = self.config.shutdown.immediate_delay_seconds;
-        let msg   = format!(
-            "IMMEDIATE SHUTDOWN in {}s — {} [{}]",
-            delay, reason,
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-        );
-        let _ = tokio::process::Command::new("wall").arg(&msg).output().await;
-        let _ = self.logger.err(&msg);
-        self.log_file_only(&msg);
+    // ── NEW: Reopen log file on SIGHUP ─────────────────────────────────────
+    pub fn reopen_log_file(&mut self) -> Result<()> {
+        let new_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+            .with_context(|| format!("Failed to reopen log file {}", self.log_path))?;
 
-        if self.test_mode {
-            println!("TEST MODE: would poweroff immediately after {}s", delay);
-            return Ok(());
-        }
-
-        let script         = self.config.shutdown.pre_shutdown_script.clone();
-        let script_timeout = self.config.shutdown.script_timeout_seconds;
-
-        tokio::spawn(async move {
-            sleep(Duration::from_secs(delay)).await;
-            run_script_and_poweroff(script, script_timeout).await;
-        });
-
+        self.log_file = new_file;
+        self.info("Log file reopened (SIGHUP)");
         Ok(())
     }
 }

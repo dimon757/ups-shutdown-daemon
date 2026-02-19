@@ -1,36 +1,4 @@
-// ups-shutdown-daemon — main.rs  v1.4.0
-//
-// State-machine based trap handler for PPC/Upsmate UPS devices.
-//
-// States
-// ──────
-//  Normal    — no active condition
-//  OnBattery — #5 received; on_battery_timer running
-//              optionally: #7 received → low_battery_timer also running
-//
-// Timer-based (normal) shutdown
-// ──────────────────────────────
-//  on_battery_timer  >= time_on_battery     → delay_seconds → poweroff
-//  low_battery_timer >= time_on_low_battery → delay_seconds → poweroff
-//  (whichever fires first wins)
-//
-// Instant-shutdown traps (immediate_delay_seconds, non-cancellable)
-// ──────────────────────────────────────────────────────────────────
-//  #3  DiagnosticsFailed          #12 UpsTurnedOff
-//  #4  UpsDischarged              #15 UpsRebootStarted
-//  #52 UpsScheduleShutdown        #54 UpsShortCircuitShutdown
-//  #57 UpsHighDCShutdown          #58 UpsEmergencyStop
-//  #61 UpsOverTemperatureShutdown #62 UpsOverLoadShutdown
-//  #67 UpsLowBatteryShutdown
-//
-// Cancel conditions
-// ──────────────────
-//  OnBattery state: trap #9 (PowerRestored) or #49 (UpsBypassAcNormal)
-//
-// Informational only (logged, no state change, no action)
-// ──────────────────────────────────────────────────────
-//  #1  CommunicationLost        — logged only
-//  #8  CommunicationEstablished — logged only
+// src/main.rs — ups-shutdown-daemon v1.5.0
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -59,9 +27,11 @@ use trap::UpsTrap;
 struct Args {
     #[arg(short, long, default_value = "/etc/ups-shutdown/config.toml")]
     config: PathBuf,
+
     /// Simulate shutdown decisions without actually powering off.
     #[arg(short, long)]
     test_mode: bool,
+
     /// Print every received trap and decision to stdout.
     #[arg(short, long)]
     verbose: bool,
@@ -71,16 +41,12 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    // Thin wrapper: init validates the environment, run drives the event loop.
-    // Errors from either surface here with their full context chain.
     let (mut mgr, socket, verbose) = init().await?;
     run(&mut mgr, socket, verbose).await
 }
 
 // ── Startup ─────────────────────────────────────────────────────────────────
 
-/// Validate environment, load config, open resources, print banner.
-/// Returns a fully initialised manager, bound UDP socket, and verbose flag.
 async fn init() -> Result<(ShutdownManager, UdpSocket, bool)> {
     let args = Args::parse();
 
@@ -92,24 +58,24 @@ async fn init() -> Result<(ShutdownManager, UdpSocket, bool)> {
     config.validate()?;
     let verbose = args.verbose || config.logging.verbose;
 
-    // Open the log file once here; the handle is moved into ShutdownManager
-    // and held open for the daemon lifetime — no open/close overhead per line.
+    let log_path = config.logging.trap_log_file.clone();
+
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&config.logging.trap_log_file)
+        .open(&log_path)
         .with_context(|| format!(
             "Trap log '{}' not writable — check path and permissions",
-            config.logging.trap_log_file
+            log_path
         ))?;
 
-    println!("ups-shutdown-daemon v{} starting", env!("CARGO_PKG_VERSION"));
+    println!("ups-shutdown-daemon v1.5.0 starting");
     println!("  Config              : {}", args.config.display());
     println!("  Port                : {}", config.snmp.trap_port);
     println!("  time_on_battery     : {}s", config.shutdown.time_on_battery);
     println!("  time_on_low_battery : {}s", config.shutdown.time_on_low_battery);
-    println!("  delay_seconds       : {}s (normal shutdown countdown)", config.shutdown.delay_seconds);
-    println!("  immediate_delay     : {}s (instant-shutdown traps)", config.shutdown.immediate_delay_seconds);
+    println!("  delay_seconds       : {}s", config.shutdown.delay_seconds);
+    println!("  immediate_delay     : {}s", config.shutdown.immediate_delay_seconds);
     println!("  Test mode           : {}", args.test_mode);
     println!("  Verbose             : {}", verbose);
 
@@ -117,7 +83,7 @@ async fn init() -> Result<(ShutdownManager, UdpSocket, bool)> {
         .await
         .with_context(|| format!("Cannot bind UDP port {}", config.snmp.trap_port))?;
 
-    let mgr = ShutdownManager::new(config, log_file, args.test_mode, verbose)?;
+    let mgr = ShutdownManager::new(config, log_path, log_file, args.test_mode, verbose)?;
 
     println!("Ready — listening for SNMP traps.");
     Ok((mgr, socket, verbose))
@@ -125,9 +91,8 @@ async fn init() -> Result<(ShutdownManager, UdpSocket, bool)> {
 
 // ── Event loop ───────────────────────────────────────────────────────────────
 
-/// Drive the three-way select: UDP packets, signals, 10s battery tick.
-async fn run(mgr: &mut ShutdownManager, socket: UdpSocket, verbose: bool) -> Result<()> {
-    let mut signals = Signals::new(&[SIGTERM, SIGINT])?.fuse();
+async fn run(mgr: &mut ShutdownManager, socket: UdpSocket, _verbose: bool) -> Result<()> {
+    let mut signals = Signals::new(&[SIGTERM, SIGINT, SIGHUP])?.fuse();
     let mut buf     = [0u8; 4096];
 
     loop {
@@ -138,8 +103,6 @@ async fn run(mgr: &mut ShutdownManager, socket: UdpSocket, verbose: bool) -> Res
                     Ok(x)  => x,
                     Err(e) => { mgr.warn(&format!("recv_from error: {}", e)); continue; }
                 };
-
-                if verbose { println!("\nReceived {} bytes from {}", len, src); }
 
                 if !mgr.is_allowed_source(&src) {
                     mgr.warn(&format!("Rejected: source {} not in allowed_sources", src));
@@ -154,10 +117,7 @@ async fn run(mgr: &mut ShutdownManager, socket: UdpSocket, verbose: bool) -> Res
                             ));
                             continue;
                         }
-                        if verbose {
-                            println!("OID: {}", parsed.oid.iter()
-                                .map(|n| n.to_string()).collect::<Vec<_>>().join("."));
-                        }
+
                         let trap = UpsTrap::from_oid(&parsed.oid);
                         let _ = mgr.handle_trap(trap, src).await;
                     }
@@ -167,13 +127,23 @@ async fn run(mgr: &mut ShutdownManager, socket: UdpSocket, verbose: bool) -> Res
                 }
             }
 
-            // ── SIGTERM / SIGINT ─────────────────────────────────────────
-            _ = signals.next() => {
-                println!("\nSignal received — daemon stopping.");
-                break;
+            // ── SIGTERM / SIGINT / SIGHUP ────────────────────────────────
+            Some(sig) = signals.next() => {
+                match sig {
+                    SIGTERM | SIGINT => {
+                        println!("\nSignal received — daemon stopping.");
+                        break;
+                    }
+                    SIGHUP => {
+                        if let Err(e) = mgr.reopen_log_file() {
+                            eprintln!("Failed to reopen log file on SIGHUP: {}", e);
+                        }
+                    }
+                    _ => {}
+                }
             }
 
-            // ── 10-second tick — active only when in OnBattery ──────────
+            // ── 10-second tick (only when in OnBattery) ─────────────────
             _ = OptionFuture::from(
                     mgr.tick_interval_mut().map(|i| i.tick())
                 ), if mgr.has_tick() => {
